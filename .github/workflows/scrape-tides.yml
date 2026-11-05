@@ -3,14 +3,12 @@ name: Scrape SG tides
 on:
   workflow_dispatch:
     inputs:
-      mode:
-        description: "discover = inspect page/network only; full = scrape 2015 to now"
-        type: choice
-        options: [discover, full]
-        default: discover
       start_year:
         description: "Start year"
         default: "2015"
+
+permissions:
+  contents: write
 
 jobs:
   scrape:
@@ -20,38 +18,23 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install playwright beautifulsoup4 && playwright install --with-deps chromium
-      - name: Discover
-        if: ${{ inputs.mode == 'discover' }}
-        run: python scrape_tides.py --discover
-      - name: Full scrape
-        if: ${{ inputs.mode == 'full' }}
-        run: python scrape_tides.py --start-year ${{ inputs.start_year }}
-      - name: Print discovery output to log
-        if: ${{ always() }}
+      - run: pip install requests beautifulsoup4
+      - name: Scrape
+        run: python scrape_tides.py --start-year "${{ inputs.start_year || '2015' }}" --out data
+      - name: Preview
         run: |
-          echo "=== network_log.txt (non-static) ==="
-          grep -v -E '\.(png|jpg|jpeg|svg|woff2?|ttf|ico|gif|css)(\?|$)' out/network_log.txt || true
-          echo "=== debug_scripts.js (first 12000 chars) ==="
-          head -c 12000 out/debug_scripts.js || true
-          echo
-          echo "=== 2015-Jan table check ==="
-          python - <<'PY'
-          import re
-          from bs4 import BeautifulSoup
-          for f in ("out/debug_initial.html", "out/debug_2015_jan.html"):
-              try:
-                  soup = BeautifulSoup(open(f, encoding="utf-8").read(), "html.parser")
-              except FileNotFoundError:
-                  print(f, "missing"); continue
-              ts = soup.find_all("table")
-              print(f, "tables:", len(ts))
-              for t in ts:
-                  txt = t.get_text(" ", strip=True)
-                  print("  ", txt[:60].replace("\n", " "), "| rows:", len(t.find_all("tr")))
-          PY
+          head -5 data/tides.csv
+          echo ...
+          tail -3 data/tides.csv
+          wc -l data/*.csv
       - uses: actions/upload-artifact@v4
-        if: always()
         with:
           name: tides-output
-          path: out/
+          path: data/
+      - name: Commit data to repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git diff --cached --quiet || git commit -m "Update tide data"
+          git push

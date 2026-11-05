@@ -1,38 +1,42 @@
 """Scrape Singapore monthly tide + astronomical tables (MSS / MPA data).
 
-Source: https://www.weather.gov.sg/weather-astronomical-and-tidal-information-monthly-data/
-The page only ships the current month in its static HTML; other year/month
-tabs are switched client-side, so this drives a headless browser.
+The monthly page loads each table with a form POST:
+  POST .../wiptheme/page-functions/functions-sun-moon-tide-ajax.php
+       smt_year=2015&smt_month=January
+which returns the <thead>/<tbody> HTML. We call it directly.
 
-Outputs (in ./out):
-  tides.csv       datetime_sgt, height_m, type (H/L)
-  astro.csv       date, sunrise, sunset, moonrise, moonset, moon_fraction
-  network_log.txt every request the page made (to spot a direct data endpoint)
-  debug_*.html    page HTML on failures
-Usage: python scrape_tides.py [--start-year 2015] [--end-year 2026] [--discover]
+Day rows have 9 cells (day, sun rise/set, moon rise/set, fraction, tide time,
+height, H/L) with rowspan; the following rows for that day have only 3 cells
+(tide time, height, H/L).
+
+Outputs (default ./data):
+  tides.csv  datetime_sgt, height_m, type (H/L)
+  astro.csv  date, sunrise, sunset, moonrise, moonset, moon_fraction
+Usage: python scrape_tides.py [--start-year 2015] [--end-year 2026] [--out data]
 """
 import argparse
+import calendar
 import csv
 import hashlib
 import re
 import sys
 import time
-from datetime import datetime, date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+import requests
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
 
-URL = "https://www.weather.gov.sg/weather-astronomical-and-tidal-information-monthly-data/"
-MONTHS = ["January", "February", "March", "April", "May", "June", "July",
-          "August", "September", "October", "November", "December"]
-OUT = Path("out")
+PAGE = "https://www.weather.gov.sg/weather-astronomical-and-tidal-information-monthly-data/"
+ENDPOINT = ("https://www.weather.gov.sg/wp-content/themes/wiptheme/"
+            "page-functions/functions-sun-moon-tide-ajax.php")
+MONTHS = list(calendar.month_name)[1:]
+SGT = timezone(timedelta(hours=8))
 
 
 def to_24h(s):
     """'4.18 am' -> '04:18'; 'NIL'/'' -> None"""
-    s = (s or "").strip().lower()
-    m = re.match(r"^(\d{1,2})[.:](\d{2})\s*(am|pm)$", s)
+    m = re.match(r"^(\d{1,2})[.:](\d{2})\s*(am|pm)$", (s or "").strip().lower())
     if not m:
         return None
     h, mi, ap = int(m.group(1)), int(m.group(2)), m.group(3)
@@ -43,155 +47,117 @@ def to_24h(s):
     return f"{h:02d}:{mi:02d}"
 
 
-def parse_table(html, year, month):
-    """Return (tide_rows, astro_rows) for the visible monthly table."""
+def parse_month(html, year, month):
+    """Parse the endpoint response -> (tides, astro, header_abbrev)."""
     soup = BeautifulSoup(html, "html.parser")
-    best = None
-    for t in soup.find_all("table"):
-        txt = t.get_text(" ", strip=True)
-        if "Rise" in txt and "Height" in txt:
-            best = t
-            # prefer a visible-looking table whose header matches the month
-            if txt.startswith(MONTHS[month - 1][:3]):
-                break
-    if best is None:
-        return [], [], None
-    header = best.get_text(" ", strip=True)[:3]
+    th = soup.find("th")
+    header = th.get_text(strip=True) if th else None
     tides, astro = [], []
     day = None
-    for tr in best.find_all("tr"):
-        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
-        if len(cells) < 9:
+    for tr in soup.find_all("tr"):
+        if tr.find("th"):
             continue
-        d = cells[0]
-        if d.isdigit():
-            day = int(d)
-            dt = date(year, month, day)
+        cells = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+        if len(cells) == 9 and cells[0].isdigit():
+            day = int(cells[0])
+            d = date(year, month, day)
             astro.append({
-                "date": dt.isoformat(),
+                "date": d.isoformat(),
                 "sunrise": to_24h(cells[1]), "sunset": to_24h(cells[2]),
                 "moonrise": to_24h(cells[3]), "moonset": to_24h(cells[4]),
                 "moon_fraction": cells[5],
             })
-        elif d == "" and day is not None:
-            dt = date(year, month, day)
+            tide = cells[6:9]
+        elif len(cells) == 3 and day is not None:
+            tide = cells
         else:
-            continue  # header rows
-        tm, ht, hl = to_24h(cells[6]), cells[7], cells[8]
+            continue
+        tm = to_24h(tide[0])
+        hl = tide[2].strip().upper()
         if tm and hl in ("H", "L"):
-            h = re.sub(r"[^0-9.\-]", "", ht)
             tides.append({
-                "datetime_sgt": f"{dt.isoformat()} {tm}",
-                "height_m": h, "type": hl,
+                "datetime_sgt": f"{date(year, month, day).isoformat()} {tm}",
+                "height_m": re.sub(r"[^0-9.\-]", "", tide[1]),
+                "type": hl,
             })
     return tides, astro, header
 
 
-def click_text(page, scope_hint, text):
-    """Trigger a year/month tab link by exact text.
-
-    The links live in collapsed dropdowns (hidden), e.g.
-    <a href="#2015" class="dropdown-item" onclick="change_smt_year('2015')">,
-    so a normal Playwright click times out. Fire the element's own click via JS.
-    """
-    loc = page.locator(f'a[href="#{text}"]')
-    if loc.count() == 0:
-        raise RuntimeError(f"no link for {text}")
-    loc.first.evaluate("el => el.click()")
+def fetch_month(sess, year, month, tries=4):
+    for attempt in range(1, tries + 1):
+        try:
+            r = sess.post(ENDPOINT, data={"smt_year": str(year),
+                                          "smt_month": MONTHS[month - 1]},
+                          headers={"Referer": PAGE,
+                                   "X-Requested-With": "XMLHttpRequest"},
+                          timeout=30)
+            if r.status_code == 200 and "<tr" in r.text:
+                return r.text
+            print(f"[warn] {year}-{month:02d}: HTTP {r.status_code}, "
+                  f"{len(r.text)} bytes (try {attempt})", file=sys.stderr)
+        except requests.RequestException as e:
+            print(f"[warn] {year}-{month:02d}: {e} (try {attempt})", file=sys.stderr)
+        time.sleep(2 * attempt)
+    return None
 
 
 def main():
+    now = datetime.now(SGT)
     ap = argparse.ArgumentParser()
     ap.add_argument("--start-year", type=int, default=2015)
-    ap.add_argument("--end-year", type=int, default=datetime.now().year)
-    ap.add_argument("--discover", action="store_true",
-                    help="only load the page, dump network log + HTML, exit")
+    ap.add_argument("--end-year", type=int, default=now.year)
+    ap.add_argument("--out", default="data")
     args = ap.parse_args()
-    OUT.mkdir(exist_ok=True)
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
 
-    net = []
-    all_tides, all_astro, seen = [], [], {}
+    sess = requests.Session()
+    sess.headers["User-Agent"] = "Mozilla/5.0 (compatible; tide-data-scraper)"
+    all_tides, all_astro, seen, problems = [], [], {}, []
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page()
-        def on_resp(r):
-            line = f"{r.request.method} {r.status} {r.request.resource_type} {r.url}"
-            if "sun-moon-tide-ajax" in r.url:
-                try:
-                    body = r.text()
-                except Exception as e:  # noqa
-                    body = f"<no body: {e}>"
-                line += (f"\n    POSTDATA: {r.request.post_data}"
-                         f"\n    HEADERS: {r.request.headers.get('content-type')}"
-                         f"\n    RESPONSE[{len(body)}]: {body[:1500]!r}")
-            net.append(line)
-        page.on("response", on_resp)
-        page.goto(URL, wait_until="networkidle")
-        (OUT / "debug_initial.html").write_text(page.content(), encoding="utf-8")
-        scripts = page.evaluate(
-            "() => Array.from(document.scripts).map(s => s.src ? '// SRC ' + s.src : s.textContent)"
-            ".filter(t => t.startsWith('// SRC') || /change_smt|smt_/.test(t)).join('\\n\\n/* ---- */\\n\\n')")
-        (OUT / "debug_scripts.js").write_text(scripts or "// none inline", encoding="utf-8")
-
-        if args.discover:
-            # click one old month to see what request (if any) fires
-            click_text(page, "year", "2015")
-            page.wait_for_timeout(1500)
-            click_text(page, "month", "January")
-            page.wait_for_timeout(2000)
-            (OUT / "debug_2015_jan.html").write_text(page.content(), encoding="utf-8")
-            (OUT / "network_log.txt").write_text("\n".join(net), encoding="utf-8")
-            browser.close()
-            return
-
-        for year in range(args.start_year, args.end_year + 1):
-            try:
-                click_text(page, "year", str(year))
-                page.wait_for_timeout(800)
-            except Exception as e:
-                print(f"[warn] year {year}: cannot click tab ({e})", file=sys.stderr)
+    for year in range(args.start_year, args.end_year + 1):
+        for month in range(1, 13):
+            if (year, month) > (now.year, now.month):
+                break
+            html = fetch_month(sess, year, month)
+            if html is None:
+                problems.append(f"{year}-{month:02d}: fetch failed")
                 continue
-            for mi, mname in enumerate(MONTHS, start=1):
-                if year == datetime.now().year and mi > datetime.now().month + 1:
-                    break
-                try:
-                    click_text(page, "month", mname)
-                    page.wait_for_timeout(700)
-                    tides, astro, header = parse_table(page.content(), year, mi)
-                except Exception as e:
-                    print(f"[warn] {year}-{mi:02d}: {e}", file=sys.stderr)
-                    continue
-                if not tides:
-                    print(f"[warn] {year}-{mi:02d}: no rows", file=sys.stderr)
-                    continue
-                if header != mname[:3]:
-                    print(f"[warn] {year}-{mi:02d}: table header '{header}' != {mname[:3]}",
-                          file=sys.stderr)
-                    continue
-                sig = hashlib.md5(repr(astro).encode()).hexdigest()
-                if sig in seen:
-                    print(f"[warn] {year}-{mi:02d} identical to {seen[sig]} - tab switch "
-                          f"probably failed, skipping", file=sys.stderr)
-                    continue
-                seen[sig] = f"{year}-{mi:02d}"
-                all_tides += tides
-                all_astro += astro
-                print(f"{year}-{mi:02d}: {len(tides)} tides, {len(astro)} days")
-                time.sleep(0.3)  # be polite
-        browser.close()
+            tides, astro, header = parse_month(html, year, month)
+            ndays = calendar.monthrange(year, month)[1]
+            if header != MONTHS[month - 1][:3]:
+                problems.append(f"{year}-{month:02d}: header {header!r}")
+                continue
+            if len(astro) != ndays:
+                problems.append(f"{year}-{month:02d}: {len(astro)} day rows, expected {ndays}")
+            if not tides:
+                problems.append(f"{year}-{month:02d}: no tide rows")
+                continue
+            sig = hashlib.md5(repr(astro).encode()).hexdigest()
+            if sig in seen:
+                problems.append(f"{year}-{month:02d}: identical to {seen[sig]}")
+                continue
+            seen[sig] = f"{year}-{month:02d}"
+            all_tides += tides
+            all_astro += astro
+            print(f"{year}-{month:02d}: {len(tides)} tides over {len(astro)} days")
+            time.sleep(0.5)  # be polite
 
-    (OUT / "network_log.txt").write_text("\n".join(net), encoding="utf-8")
     for name, rows, cols in [
         ("tides.csv", all_tides, ["datetime_sgt", "height_m", "type"]),
         ("astro.csv", all_astro,
          ["date", "sunrise", "sunset", "moonrise", "moonset", "moon_fraction"]),
     ]:
-        with open(OUT / name, "w", newline="") as f:
+        with open(out / name, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=cols)
             w.writeheader()
             w.writerows(rows)
-    print(f"done: {len(all_tides)} tide events, {len(all_astro)} days")
+    print(f"\ndone: {len(all_tides)} tide events, {len(all_astro)} days "
+          f"-> {out}/")
+    if problems:
+        print("PROBLEMS:")
+        for p in problems:
+            print("  ", p)
 
 
 if __name__ == "__main__":
