@@ -27,6 +27,29 @@ jobs:
       - name: Full scrape
         if: ${{ inputs.mode == 'full' }}
         run: python scrape_tides.py --start-year ${{ inputs.start_year }}
+      - name: Print discovery output to log
+        if: ${{ always() }}
+        run: |
+          echo "=== network_log.txt (non-static) ==="
+          grep -v -E '\.(png|jpg|jpeg|svg|woff2?|ttf|ico|gif|css)(\?|$)' out/network_log.txt || true
+          echo "=== debug_scripts.js (first 12000 chars) ==="
+          head -c 12000 out/debug_scripts.js || true
+          echo
+          echo "=== 2015-Jan table check ==="
+          python - <<'PY'
+          import re
+          from bs4 import BeautifulSoup
+          for f in ("out/debug_initial.html", "out/debug_2015_jan.html"):
+              try:
+                  soup = BeautifulSoup(open(f, encoding="utf-8").read(), "html.parser")
+              except FileNotFoundError:
+                  print(f, "missing"); continue
+              ts = soup.find_all("table")
+              print(f, "tables:", len(ts))
+              for t in ts:
+                  txt = t.get_text(" ", strip=True)
+                  print("  ", txt[:60].replace("\n", " "), "| rows:", len(t.find_all("tr")))
+          PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:
