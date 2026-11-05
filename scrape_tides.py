@@ -115,8 +115,18 @@ def main():
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page()
-        page.on("response", lambda r: net.append(
-            f"{r.request.method} {r.status} {r.request.resource_type} {r.url}"))
+        def on_resp(r):
+            line = f"{r.request.method} {r.status} {r.request.resource_type} {r.url}"
+            if "sun-moon-tide-ajax" in r.url:
+                try:
+                    body = r.text()
+                except Exception as e:  # noqa
+                    body = f"<no body: {e}>"
+                line += (f"\n    POSTDATA: {r.request.post_data}"
+                         f"\n    HEADERS: {r.request.headers.get('content-type')}"
+                         f"\n    RESPONSE[{len(body)}]: {body[:1500]!r}")
+            net.append(line)
+        page.on("response", on_resp)
         page.goto(URL, wait_until="networkidle")
         (OUT / "debug_initial.html").write_text(page.content(), encoding="utf-8")
         scripts = page.evaluate(
