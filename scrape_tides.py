@@ -88,11 +88,16 @@ def parse_table(html, year, month):
 
 
 def click_text(page, scope_hint, text):
-    """Click a tab link by exact text (year '2015' or month 'January')."""
+    """Trigger a year/month tab link by exact text.
+
+    The links live in collapsed dropdowns (hidden), e.g.
+    <a href="#2015" class="dropdown-item" onclick="change_smt_year('2015')">,
+    so a normal Playwright click times out. Fire the element's own click via JS.
+    """
     loc = page.locator(f'a[href="#{text}"]')
     if loc.count() == 0:
-        loc = page.get_by_role("link", name=text, exact=True)
-    loc.first.click()
+        raise RuntimeError(f"no link for {text}")
+    loc.first.evaluate("el => el.click()")
 
 
 def main():
@@ -114,6 +119,10 @@ def main():
             f"{r.request.method} {r.status} {r.request.resource_type} {r.url}"))
         page.goto(URL, wait_until="networkidle")
         (OUT / "debug_initial.html").write_text(page.content(), encoding="utf-8")
+        scripts = page.evaluate(
+            "() => Array.from(document.scripts).map(s => s.src ? '// SRC ' + s.src : s.textContent)"
+            ".filter(t => t.startsWith('// SRC') || /change_smt|smt_/.test(t)).join('\\n\\n/* ---- */\\n\\n')")
+        (OUT / "debug_scripts.js").write_text(scripts or "// none inline", encoding="utf-8")
 
         if args.discover:
             # click one old month to see what request (if any) fires
