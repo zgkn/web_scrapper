@@ -1,0 +1,49 @@
+name: Scrape ASMC hotspots
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "Start date YYYY-MM-DD (blank = 90 days ago)"
+        default: ""
+      end:
+        description: "Exclusive end date YYYY-MM-DD (blank = today)"
+        default: ""
+      daynight:
+        description: "both / day / night"
+        default: "both"
+      conf:
+        description: "all / High / Medium / Low"
+        default: "all"
+permissions:
+  contents: write
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - name: Scrape
+        run: |
+          ARGS="--daynight ${{ inputs.daynight || 'both' }} --conf ${{ inputs.conf || 'all' }}"
+          [ -n "${{ inputs.start }}" ] && ARGS="$ARGS --start ${{ inputs.start }}"
+          [ -n "${{ inputs.end }}" ] && ARGS="$ARGS --end ${{ inputs.end }}"
+          python scrape_hotspots.py $ARGS
+      - name: Preview
+        run: |
+          head -8 data/hotspot_counts_daily.csv
+          wc -l data/hotspot_counts_daily.csv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hotspot-output
+          path: data/hotspot_counts_daily.csv
+      - name: Commit data to repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git diff --cached --quiet || git commit -m "Update hotspot counts"
+          git pull --rebase -q origin main || true
+          git push
